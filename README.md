@@ -1,238 +1,289 @@
 # DWM3001CDK UWB 지게차 안전 시스템
 
-UWB(Ultra-Wideband) 기반 TDOA 측위를 이용한 지게차-작업자 충돌 예측 시스템입니다.
+지게차에 탑재한 UWB 앵커 4대로 작업자 태그의 상대 위치를 실시간 추정한다.
+고정 인프라 없이 **지게차 자체가 이동형 앵커 배열**로 동작한다.
+
+과제: RS-2026-25505818 · 아주대학교 AiCONS Lab
 
 ---
 
-## 시스템 개요
+## 측위 방식
+
+앵커 4대가 지게차 지붕 1 m 이내에 모여 있다. 이 배열은 **방향 탐지기에 가깝고
+삼변측량기가 아니다.** 실측으로 확인된 내용:
 
 ```
-작업자 (Sender/Tag)
-  └─ UWB 신호 발사
-        ↓
-지게차 위 Receiver 4대 (DWM3001CDK, LISTENER 모드)
-  └─ 각각 TS4ns 타임스탬프로 수신
-        ↓
-Raspberry Pi 4
-  └─ 로그 수집 → TDOA 계산 → 작업자 위치 파악 → 충돌 예측/회피
+기준거리 r₁ 을 0.3 → 10 m 로 33배 바꿔도
+  해의 거리   0.62 → 13.84 m   (22배 변함)
+  잔차       16.96 → 17.25 cm  (0.54 cm 변함, 측정 잡음 3 cm 의 1/6)
 ```
 
-- **Sender**: 작업자 착용 UWB 모듈 (INITF 역할)
-- **Receiver**: 지게차 탑재 DWM3001CDK 4대 (LISTENER 모드)
-- **호스트**: Raspberry Pi 4 (빌드 + 플래시 + 데이터 수집)
+TDoA 만으로는 거리가 결정되지 않는다. 그래서 역할을 나눈다.
 
----
-
-## 하드웨어 구성
-
-| 장치 | 역할 | 수량 |
+| 얻는 것 | 방식 | 근거 |
 |---|---|---|
-| DWM3001CDK | UWB 모듈 (nRF52833 + QM33) | 4대 (Receiver) + 1대 (Sender) |
-| Raspberry Pi 4 | 빌드 머신 + 데이터 수집 서버 | 1대 |
-| MacBook (개발) | 원격 접속 및 코드 수정 | 1대 |
+| **방위** | TDoA | 앵커 4대의 수신 시각 차이 |
+| **거리** | SS-TWR | 마스터↔태그 왕복 시간 |
+| 좌표 | 삼변측량 + Gauss-Newton | 둘을 합침 |
 
-### DWM3001CDK 포트 구분
+### 핵심 — 동기 프레임 하나가 세 역할을 겸한다
 
-| 포트 | 역할 |
+마스터(RX1)가 주기적으로 쏘는 동기 프레임을 **앵커와 태그가 함께 듣는다.**
+
+```
+① 앵커 3대의 시계를 마스터에 맞춤
+② 태그의 시계를 마스터에 맞춤
+③ 그 과정이 곧 왕복 거리 측정
+```
+
+③이 성립하는 이유: 태그가 동기 프레임을 받을 때 마스터→태그 비행시간이
+이미 섞여 들어가고, blink 가 돌아올 때 한 번 더 더해진다.
+
+```
+ToF₁ = 2·d₁ + K        ← 왕복
+```
+
+**추가 공중 트래픽이 0이고 태그 수에 무관하게 확장된다.**
+일반적인 TWR+TDoA 하이브리드가 트래픽을 두 배로 쓰는 것과 다르다.
+
+---
+
+## 시스템 구성
+
+| | 역할 | 송신 | 수신 |
+|---|---|---|---|
+| **RX1** | 앵커 + **기준 시계** | 동기 프레임 (~50 Hz) | 태그 blink |
+| RX2·3·4 | 앵커 | — | 동기 프레임 + 태그 blink |
+| 태그 | 작업자 착용 | blink (~10 Hz) | **동기 프레임** |
+| Raspberry Pi 4 | 호스트 | — | UART 4채널 |
+
+**보드는 계산을 하지 않는다.** DW3000 하드웨어가 안테나에서 래치한
+타임스탬프를 UART 로 보고할 뿐이고, 시계 통일·TDoA·거리·좌표는 전부 호스트가
+계산한다.
+
+### 왜 하드웨어 타임스탬프인가
+
+호스트 시각을 기준으로 삼는 방식(CLI TSYNC)을 먼저 시도했다가 기각했다.
+
+| | 필요 | 실제 | 배율 |
+|---|---|---|---|
+| 매핑 정확도 (200회 평균) | 0.3 m | 34 km | 11만 |
+| 타임스탬프 분해능 | 1.0 ns | 4.0064 ns | 4 |
+| 재동기 주기 | 370 µs | 22 ms | 59 |
+
+원인은 **소프트웨어가 측정 순간을 결정**한다는 데 있었다. 지터 3.3 ms 가
+그대로 오차가 된다. 동기 프레임 방식은 그 결정권을 전파에 넘긴 것이다.
+
+UART 전송이 25 패킷 지연되어도 결과가 0.5 cm 밖에 안 변하는 것으로 검증했다.
+
+---
+
+## 하드웨어
+
+| 장치 | 수량 | 비고 |
+|---|---|---|
+| DWM3001CDK | 5 | 앵커 4 + 태그 1 (nRF52833 + DW3000) |
+| Raspberry Pi 4 | 1 | 빌드 + 데이터 수집 + 측위 |
+
+- UART **230400** 고정 (921600 은 실레이트 937,500 으로 문자 누락)
+- J9 포트 사용, `USB_ENABLE` 제거
+- 커스텀 PCB 없음 → 공통 클럭·SYNC 배선 불가, 무선 동기화가 유일 경로
+
+```
+보드 S/N
+  RX1 760197764   RX2 760144486   RX3 760143773   RX4 760197326
+  TX  760145556
+```
+
+---
+
+## 저장소 구조
+
+```
+host/           호스트 스크립트 (Raspberry Pi)
+firmware/       Qorvo DW3_QM33_SDK 1.1.1 수정 파일만
+scripts/        빌드·플래시 셸 스크립트
+docs/           인수인계·기술문서·캘리브레이션 기록
+data/           회귀 검증용 참조 로그
+archive/        기각된 접근 (CLI TSYNC) — 근거 보존
+```
+
+### host/
+
+| 파일 | 용도 |
 |---|---|
-| **J9** | J-Link (플래시) + UART 통신 |
-| **J20** | USB CDC 통신 (USB_ENABLE 옵션 시) |
+| `uwb_realtime.py` | **실시간 측위** |
+| `uwb_web.py` | 웹 뷰어 (브라우저로 실시간 확인) |
+| `uwb_xy.py` | 캘리브레이션 |
+| `uwb_logger.py` | UART 4채널 로그 수집 |
+| `uwb_position.py` | 배치 분석. **앵커 좌표 정의** — 다른 스크립트가 참조 |
+| `uwb_range.py` | TWR 거리 검증 |
+| `uwb_twr_test.py` | TWR 다지점 검증 + 그래프 |
+| `uwb_tdoa_only.py` | TDoA 단독 한계 실증 |
 
----
+### firmware/ — SDK 어디에 넣는가
 
-## 개발 환경 구축
-
-### 1. Raspberry Pi OS 설치
-Raspberry Pi Imager로 64-bit OS를 microSD에 굽습니다.
-
-### 2. Raspberry Pi SSH 접속
-
-### 3. Raspberry Pi 패키지 설치
-
-```bash
-sudo apt update && sudo apt upgrade -y
-sudo apt install -y cmake make python3 python3-pip python3-venv git screen
 ```
-
-### 4. ARM 툴체인 설치 (aarch64용)
-
-```bash
-cd ~
-wget "https://developer.arm.com/-/media/Files/downloads/gnu-rm/10.3-2021.10/gcc-arm-none-eabi-10.3-2021.10-aarch64-linux.tar.bz2"
-sudo mkdir -p /opt/gcc-arm
-sudo tar -xvf gcc-arm-none-eabi-10.3-2021.10-aarch64-linux.tar.bz2 -C /opt/gcc-arm
-echo 'export PATH="/opt/gcc-arm/gcc-arm-none-eabi-10.3-2021.10/bin:$PATH"' >> ~/.bashrc
-source ~/.bashrc
-
-# 확인
-arm-none-eabi-gcc --version
-```
-
-### 5. J-Link 설치
-
-1. PC에서 https://www.segger.com/downloads/jlink/ 접속합니다. 
-2. Linux ARM 64-bit `.deb` 다운로드 후 Raspberry로 전송합니다.
-3. .deb파일을 dpkg로 설치합니다.
-```bash
-# Raspberry Pi에서
-sudo dpkg -i ~/JLink_Linux_V946_arm64.deb
-```
-
-### 6. SDK 다운로드 및 Raspberry Pi로 전송
-
-1. Qorvo 공식 사이트 https://www.qorvo.com/products/p/DWM3001CDK 에서 하단 Documents/Software **DW3xxx & QM3xxx SDK v1.1.1.zip**를 다운로드합니다.
-2. 압축을 풀면 나오는 폴더인 DW3_QM33_SDK를 Raspberry Pi로 전송합니다.
-
-
-### 7. 이 repo clone 및 수정 파일 적용
-
-Raspberry Pi에서 이 repo를 clone한 후 수정 파일들을 SDK에 덮어써주세요:
-
-```bash
-# Raspberry Pi에서
-cp uwb-forklift-safety/firmware/task_listener.c ~/DW3_QM33_SDK/SDK/Firmware/DW3_QM33_SDK_1.1.1/Src/Apps/Src/listener/
-cp uwb-forklift-safety/firmware/project_CLI.cmake ~/DW3_QM33_SDK/SDK/Firmware/DW3_QM33_SDK_1.1.1/Projects/FreeRTOS/CLI/DWM3001CDK/
-cp uwb-forklift-safety/scripts/uwb_logger.py ~/
-cp uwb-forklift-safety/scripts/flash_all.sh ~/
-chmod +x ~/flash_all.sh
-```
-
-### 9. Python 가상환경 세팅
-
-```bash
-cd ~/DW3_QM33_SDK/SDK/Firmware/DW3_QM33_SDK_1.1.1
-python3 -m venv .venv
-source .venv/bin/activate
-pip install -r requirements.txt
-pip install pyserial
+simpletx.c        → Src/Apps/Src/simpletx/
+task_listener.c   → Src/Apps/Src/listener/
+listener_fn.c     → Src/Apps/Src/listener/
+HAL_uart.c        → Src/HAL/Src/nrfx/
+cmd_fn.c          → Src/common/cmd/
+project_CLI.cmake → Projects/FreeRTOS/CLI/DWM3001CDK/
 ```
 
 ---
 
-## 소스코드 수정 내용
+## 사용법
 
-### 1. LISTENER 전체 패킷 출력 고정 (`task_listener.c`)
-
-LSTN 배열이 기본 6바이트로 잘리는 문제를 해결하기 위해 mode를 1로 고정했습니다. Sender MAC 주소 파싱을 위해 전체 패킷이 필요합니다.
-
-```c
-error_e send_to_pc_listener_info(...)
-{
-    mode = 1;  // 전체 패킷 출력 고정
-    ...
-}
-```
-
-### 2. J9 UART 통신 설정 (`project_CLI.cmake`)
-
-`USB_ENABLE`을 제거하여 J20 없이 J9 하나로 플래시 + 통신이 모두 가능하도록 설정합니다.
-
-```cmake
-set(CMAKE_CUSTOM_C_FLAGS
-    "-Werror \
-    -DBOARD_CUSTOM \
-    -DCONFIG_GPIO_AS_PINRESET"
-)
-```
-
----
-
-## 펌웨어 빌드 및 플래시
-
-### flash_all.sh 시리얼 넘버 설정
-
-보드별 J-Link 시리얼 넘버를 확인 후 `~/flash_all.sh`에 등록하세요:
+### 1. 빌드 · 플래시
 
 ```bash
-ls /dev/serial/by-id/
+cleanbuild          # SDK 재빌드
+flashreceiver       # 앵커 4대
+flashsender         # 태그
 ```
 
-| 보드 | J-Link 시리얼 |
-|---|---|
-| 보드1 | 760144486 |
-| 보드2 | 760197326 |
+⚠️ **플래시하면 NVM 의 `SETAPP`/`SAVE` 가 지워진다.** 구울 때마다 다시 설정.
 
-### 빌드 + 플래시 실행
-
-```bash
-cd ~/DW3_QM33_SDK/SDK/Firmware/DW3_QM33_SDK_1.1.1
-source .venv/bin/activate
-rm -rf BuildOutput/CLI
-python3 Projects/FreeRTOS/CLI/DWM3001CDK/CreateTarget.py -build Debug
-cd BuildOutput/CLI/FreeRTOS/DWM3001CDK/Debug
-make -j4 #수정 코드 빌드 
-~/flash_all.sh #코드를 J-Link로 자동 플래시해주는 sh 실행
 ```
-
----
-
-## 보드 초기 설정
-
-보드를 처음 플래시한 후 아래 명령어를 실행해 부팅 시 자동으로 LISTENER 모드로 시작하도록 설정합니다.
-
-```bash
-TERM=vt100 screen /dev/ttyACM0 115200
-```
-
-접속 후:
-```
-SETAPP LISTENER
+STOP
+SETAPP LISTENER     # 앵커  (태그는 SIMPLETX)
 SAVE
 ```
 
----
+### 2. 동기 마스터 켜기
 
-## 로그 수집
-
-두 보드의 LISTENER 로그를 동시에 수집하고 파일로 저장합니다.
+`SYNCM` 은 NVM 에 저장되지 않으므로 **전원 재인가마다 필요**하다.
 
 ```bash
-source ~/DW3_QM33_SDK/SDK/Firmware/DW3_QM33_SDK_1.1.1/.venv/bin/activate
-python3 ~/uwb_logger.py
+screenrx1
+```
+```
+STAT            → "Current App":"LISTENER" 확인
+SYNCM 1         → TXTS: xx 0x... 줄이 흐르는지 확인
 ```
 
-로그는 `~/uwb_logs/` 폴더에 저장됩니다.
-## 로그 포맷 분석
+### 3. 실시간 측위
 
-### LISTENER 출력 형식
-
-```json
-{"LSTN":[49,2B,01,00,26,13,00,FF,18,5A,...],"TS4ns":"0xDAB2CEA0","O":1123,"rsl":-50.96,"fsl":-51.73}
+```bash
+screenclean
+python3 host/uwb_realtime.py --k -0.5885 --delta -0.268
 ```
 
-| 필드 | 의미 |
-|---|---|
-| **LSTN** | Raw IEEE 802.15.4 MAC 프레임 (hex) |
-| **TS4ns** | UWB 수신 타임스탬프 (4ns 단위, TDOA 계산 핵심값) |
-| **O** | Clock offset (ppm) |
-| **rsl** | 수신 신호 강도 (dBm) |
-| **fsl** | 첫 번째 경로 신호 강도 (dBm) |
+다른 터미널에서 뷰어:
 
-### LSTN 배열 구조 (IEEE 802.15.4 프레임)
+```bash
+python3 host/uwb_web.py --span 4 --true 1.2,0
+```
 
-| 바이트 | 의미 |
-|---|---|
-| 0-1 | Frame Control |
-| 2 | Sequence Number |
-| 3-4 | PAN ID |
-| 5-6 | Destination Address |
-| **7-8** | **Source Address (Sender MAC = 작업자 ID)** |
-| 나머지 | STS + Payload |
+브라우저에서 `http://<라즈베리파이>:8000`
+
+### 4. 캘리브레이션
+
+`docs/CALIBRATION.md` 참조. **거리와 방위를 2단계로 분리해야 한다.**
+
+```bash
+python3 host/uwb_xy.py --calib \
+  data/D1.txt:0.5,0 data/D2.txt:1.0,0 data/D3.txt:1.6,0 \
+  data/A1.txt:1.0,0.6
+```
 
 ---
 
+## 현재 성능 (2026.10.05)
 
-## 디렉토리 구조
+앵커 50×45 cm, 태그 (1.2, 0) 고정, 좌표 1,930개:
+
+| 항목 | 값 |
+|---|---|
+| 위치 편향 | **6.2 cm** |
+| TWR 거리 편향 | **1.9 cm** |
+| 산포 (중앙) | 7.4 cm |
+| 거리 선형성 | 기울기 2.0034 (이론 2.0) |
+| 좌표 산출률 | ~10 /s (blink 주기와 동일) |
+| 처리 여유 | 실시간 대비 80배 |
+| 지연 | UART 5 ms + 연산 0.2 ms |
+
+---
+
+## 알려진 제약
+
+### 미검증 상수
+
+`K`, `DELTA` 는 안테나 지연에서 오는 상수다. **배치가 바뀌면 `DELTA` 를 다시
+구해야 한다.** 현재 방위 캘리브레이션 지점이 하나뿐이라 신뢰도가 낮다.
+
+### 태그 급이동 시 튐
+
+태그 시계 모델이 10 샘플 직선 회귀라 **등속은 흡수하지만 급가속은 못 따라간다.**
 
 ```
-~/DW3_QM33_SDK/
-└── SDK/Firmware/DW3_QM33_SDK_1.1.1/
-    ├── Projects/FreeRTOS/CLI/DWM3001CDK/
-    │   └── project_CLI.cmake          # 빌드 설정 (J9 UART...)
-    └── Src/Apps/Src/listener/
-        └── task_listener.c            # LISTENER mode=1 고정
-
-~/uwb_logger.py    # 로그 수집 스크립트
-~/flash_all.sh     # 순차 플래시 스크립트
-~/uwb_logs/        # 수집된 로그 파일들
+가속 3 m/s², blink 10 Hz, 창 10  →  30 cm 오차
+blink 50 Hz 로 올리면            →   1.2 cm
 ```
+
+회복에 약 1초. blink 빈도를 올리는 것이 근본 대응.
+
+### 앵커 평면 밖
+
+앵커 4대가 같은 평면에 있어 **높이 차가 있으면 수평 거리를 과대평가**한다.
+
+```
+수평 1 m, 높이 1.1 m  →  오차 42 cm
+수평 5 m, 높이 1.1 m  →  오차 12 cm
+```
+
+실제 운용(앵커 지붕 2.5 m, 태그 가슴 1.4 m)에서는 높이차가 고정이므로
+`√(d² − h²)` 로 보정 가능.
+
+### 다중 지게차
+
+모든 마스터가 같은 PAN ID(0x0026)와 Source MAC(0x0001)을 쓴다.
+**지게차 2대가 같은 공간에 있으면 서로의 동기 프레임을 받아 붕괴한다.**
+지게차별 ID 분리 필요.
+
+### 확장 한계
+
+| 병목 | 상한 |
+|---|---|
+| UART 대역폭 | 태그 ~10개 |
+| UWB 공중 매체 | 태그 ~30개 (TDMA 기준) |
+| CPU | 태그 수백 개 |
+
+연산이 아니라 UART 가 먼저 막힌다.
+
+---
+
+## 남은 작업
+
+1. **방위 캘리브레이션 재측정** — 방위가 다른 지점 2곳 이상
+2. 신호 세기 개선 — 현재 −78 dBm, 조건 좋을 때 −58 dBm
+3. 태그 blink 빈도 상향 (이동 대응)
+4. 지게차별 ID 분리 (2대 이상 운용 전)
+5. IMU/PDR 융합, NLoS 보정
+6. 실차 통합 — 앵커 배치·각도 커버리지 설계
+
+---
+
+## 문서
+
+| | 내용 |
+|---|---|
+| `docs/Next_person.md` | 현재 상태, 하드웨어 매핑, 진행 방향 |
+| `docs/Technical_Documentation.md` | 설계 근거, 기각된 접근, 실측 수치 |
+| `docs/Hardware_info.md` | UWB모듈 ID |
+
+### 호스트 파싱에서 반드시 지킬 것
+
+개발 중 실제로 겪은 버그들이다. 재발하면 좌표가 통째로 망가진다.
+
+| 항목 | 안 지키면 |
+|---|---|
+| 같은 카운터의 값은 **하나의 unwrap 누적기 공유** | 스케일이 2.6초 어긋남 |
+| unwrap 은 **부호 있는 차분** | 로그 순서 뒤바뀔 때 가짜 wrap |
+| SeqNum 은 unwrap 후 **256 배수 보정** | 2.61초 어긋난 짝 |
+| 바퀴 보정은 **반드시 256의 배수** | 그 외 값은 오류 |
+| 앵커 간 정렬은 **패킷 신원 기준** | 인덱스가 다른 패킷 지시 |
+| deque 버퍼 제거는 **append 전에** | 필요한 항목을 지움 |
+| 시계 모델 창은 **10** | 더 키우면 비선형 드리프트로 악화 |
